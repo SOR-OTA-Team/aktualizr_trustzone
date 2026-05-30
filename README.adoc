@@ -1,267 +1,212 @@
-:toc: macro
-:toc-title:
+= aktualizr_trustzone
 
-https://opensource.org/licenses/MPL-2.0[image:https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg[License: MPL 2.0]] https://app.codecov.io/gh/uptane/aktualizr[image:https://codecov.io/gh/uptane/aktualizr/branch/master/graph/badge.svg[codecov]] https://bestpractices.coreinfrastructure.org/projects/674[image:https://bestpractices.coreinfrastructure.org/projects/674/badge[OpenSSF Best Practices]] https://github.com/RichardLitt/standard-readme[image:https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat[standard-readme compliant]]
+`sor_aktualizr`에 TrustZone/OP-TEE 기반 TEE 서명 경로를 추가한 실험용 repository입니다.
 
-[discrete]
-= aktualizr
+이 repository는 OP-TEE source repository가 아닙니다. OP-TEE는 Jetson Orin Nano에서 Secure World를 구성하고 TA를 실행하기 위한 런타임으로만 사용했습니다.
 
-====
-C++ implementation of https://uptane.github.io[Uptane] OTA update client.
-====
+== 목표
 
-The client is intended to be installed on devices that wish to receive OTA updates from an Uptane-compatible OTA server such as https://connect.ota.here.com/[HERE OTA Connect]. It is most commonly built by using the https://github.com/uptane/meta-updater[meta-updater] layer in a Yocto environment. You can use aktualizr as a stand-alone system tool or you can integrate libaktualizr into a larger project.
+Uptane device private key를 Normal World 파일시스템이나 SQLite에 저장하지 않고, Secure World의 TA 내부에서만 생성/보관/사용하도록 분리했습니다.
 
-The client is responsible for:
-
-* Communicating with the OTA server
-* Authenticating using locally available device and user credentials
-* Reporting current software and hardware configuration to the server
-* Checking for any available updates for the device
-* Downloading any available updates
-* Installing the updates on the system, or notifying other services of the availability of the downloaded file
-* Receiving or generating installation reports (success or failure) for attempts to install received software
-* Submitting installation reports to the server
-
-The client maintains the integrity and confidentiality of the OTA update in transit, communicating with the server over a TLS link. The client can run either as a system service, periodically checking for updates, or can by triggered by other system interactions (for example on user request, or on receipt of a wake-up message from the OTA server).
-
-[discrete]
-== Table of Contents
-
-toc::[]
-
-== Security
-
-This client is aligned with the https://uptane.github.io[Uptane] security framework for software updates. Full details and documentation can be found on their site.
-
-== Installation
-
-=== Dependencies
-
-To install the minimal requirements on Debian/Ubuntu, run this:
+구조는 다음과 같습니다.
 
 ----
-sudo apt install asn1c build-essential cmake curl libarchive-dev libboost-dev libboost-filesystem-dev libboost-log-dev libboost-program-options-dev libcurl4-openssl-dev libpthread-stubs0-dev libsodium-dev libsqlite3-dev libssl-dev python3
+Normal World
+  aktualizr
+  keymanager.cc
+  tee_keystore.cc
+  libteec
+
+Secure World
+  aktualizr TA
+  RSA-2048 private key
+  RSA-PSS/SHA-256 signing
 ----
 
-The default versions packaged in recent Debian/Ubuntu releases are generally new enough to be compatible. If you are using older releases or a different variety of Linux, there are a few known minimum versions:
+Normal World는 OTA 흐름, Uptane metadata 처리, 네트워크, SQLite storage, 다운로드, 설치를 그대로 담당합니다.
 
-* cmake (>= 3.5)
-* curl (>= 7.47)
-* openssl (>= 1.0.2)
-* libboost-* (>= 1.58.0)
-* libcurl4-openssl-dev (>= 7.47)
-* libpthread-stubs0-dev (>= 0.3)
+Secure World는 최소 기능만 담당합니다.
 
-Additional packages are used for non-essential components:
+* Uptane RSA-2048 private key 생성
+* public key export
+* RSA-PSS/SHA-256 서명
 
-* To build the test suite, you will need `net-tools python3-dev python3-openssl python3-venv sqlite3 valgrind`.
-* To run the linting tools, you will need `clang clang-format-11 clang-tidy-11`.
-* To build additional documentation, you will need `doxygen graphviz`.
-* To build with code coverage, you will need `lcov`.
+ED25519는 구현하지 않았습니다. aktualizr의 기존 RSA-PSS 경로를 최대한 활용하기 위해 TEE backend는 RSA-2048 전용으로 구성했습니다.
 
-Some features also require additional packages:
+== 수정한 부분
 
-* For OSTree support, you will need `libostree-dev` (>= 2017.7).
-* For PKCS#11 support, you will need `libp11-3 libp11-dev`.
-* For fault injection, you will need `fiu-utils libfiu-dev`.
+=== Normal World
 
-==== Mac support
+`CMakeLists.txt`::
+`BUILD_TEE` 옵션을 추가하고, TEE 빌드 시 `libteec`를 링크하도록 수정했습니다.
 
-You can install the latest release of aktualizr on MacOS (mostly useful for trying out a SOTA server with a <<fake-device,fake device>>) using https://brew.sh[homebrew]:
+`include/libaktualizr/types.h`::
+`CryptoSource::kTee`를 추가했습니다.
 
-----
-brew tap advancedtelematic/otaconnect
-brew install aktualizr
-----
+`src/libaktualizr/utilities/config_utils.h`::
+TOML 설정에서 `key_source = "tee"`를 읽을 수 있도록 수정했습니다.
 
-You can build and install the latest development version of aktualizr on MacOS (current head of the development branch):
-----
-brew tap advancedtelematic/otaconnect
-brew install --HEAD aktualizr
-----
+`src/libaktualizr/crypto/keymanager.cc`::
+Uptane RSA key 생성, public key 조회, manifest 서명을 TEE backend로 보낼 수 있도록 연결했습니다.
+TEE mode에서는 private key를 SQLite `private_keys`에 저장하지 않습니다.
 
-If any of the previous release versions of aktualizr has been installed before make sure you `unlink` it prior to installing the HEAD version:
-----
-brew unlink aktualizr
-brew install --HEAD aktualizr
-----
+`src/libaktualizr/crypto/tee_keystore.h`::
+Normal World에서 사용하는 TEE backend API를 정의했습니다.
 
-You can switch back to the release version by unlinking and installing again:
-----
-brew unlink aktualizr
-brew install aktualizr
-----
+`src/libaktualizr/crypto/tee_keystore.cc`::
+`libteec` 기반 TA client를 구현했습니다.
+TA session open, public key read, RSA-PSS signing command 호출을 담당합니다.
 
-You can also build it yourself, with basic dependencies from homebrew. You can install the necessary dependencies as follows:
+`src/libaktualizr/crypto/tee_keystore_dummy.cc`::
+`BUILD_TEE=OFF` 빌드에서도 링크가 깨지지 않도록 dummy backend를 추가했습니다.
 
-----
-brew install asn1c boost cmake libarchive libsodium pkgconfig python3 openssl@1.1
-----
+`src/libaktualizr/config/config_test.cc`::
+`key_source = "tee"` 설정 파싱 테스트를 추가했습니다.
 
-and run the following from the aktualizr project directory:
-----
-export CXXFLAGS=-w
-cmake -S . -B build -DBoost_USE_MULTITHREADED=ON
-cmake --build build --target all -- -j8
+`config/sota-device-cred-tee.toml`::
+TEE key source를 사용하는 설정 예시를 추가했습니다.
 
-./build/src/aktualizr_primary/aktualizr --version
-----
+=== Secure World
 
-If you also want to compile the SOTA tools:
+`ta/aktualizr_ta.c`::
+OP-TEE TA entry point와 command dispatch를 구현했습니다.
+
+`ta/aktualizr_ta_rsa.c`::
+RSA-2048 key 생성, public key export, RSA-PSS/SHA-256 signing을 구현했습니다.
+
+`ta/aktualizr_ta.h`::
+TA UUID, command ID, key ID를 정의했습니다.
+
+`ta/user_ta_header_defines.h`::
+OP-TEE TA metadata를 정의했습니다.
+
+`ta/Makefile`, `ta/sub.mk`::
+TA 빌드 구성을 추가했습니다.
+
+== 테스트 환경
 
 ----
-brew install gettext && brew unlink gettext && brew link --force gettext
+Hardware: NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
+Jetson Linux: R36.5.0
+Kernel: 5.15.185-tegra
+OP-TEE package: nvidia-l4t-optee 36.5.0-20260115194252
 ----
 
-and run cmake with `-DBUILD_SOTA_TOOLS=ON`.
+== 빌드 테스트
 
-=== Building
-
-This project uses *git submodules*. To checkout the code:
+TEE 옵션을 켜고 aktualizr를 빌드했습니다.
 
 ----
-git clone --recursive https://github.com/uptane/aktualizr
-cd aktualizr
+cmake -S . -B build-teecheck \
+  -DBUILD_OSTREE=OFF \
+  -DBUILD_P11=OFF \
+  -DBUILD_TEE=ON \
+  -DBUILD_SOTA_TOOLS=OFF
+
+cmake --build build-teecheck --target aktualizr -j2
 ----
 
-If you had an old checkout, forgot to include `--recursive` or need to update the submodules, run:
+결과: 성공
+
+== 단위 테스트
+
+기존 keymanager/config 테스트가 깨지지 않는지 확인했습니다.
 
 ----
-git submodule update --init --recursive
+cmake --build build-default-teecheck --target t_keymanager -j2
+cd build-default-teecheck
+ctest -R test_keymanager --output-on-failure
 ----
 
-`aktualizr` is built using CMake. To setup your `build` directory:
+결과: 성공
 
 ----
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Debug ..
+cmake --build build-default-teecheck --target t_config -j2
+cd build-default-teecheck
+ctest -R test_config --output-on-failure
 ----
 
-You can then build the project from the `build` directory using Make:
+결과: 성공
+
+== TA 빌드 및 설치
+
+TA는 Jetson L4T R36.5 OP-TEE source package에서 생성한 `export-ta_arm64` dev kit으로 빌드했습니다.
 
 ----
-make
+TA_DEV_KIT_DIR=<Jetson OP-TEE export-ta_arm64> \
+  make -C ta CROSS_COMPILE=aarch64-linux-gnu-
 ----
 
-To use CMake's link:https://ninja-build.org/[Ninja] backend, add `-G Ninja` to the first CMake invocation. It has the advantage of running all targets in parallel by default and is recommended for local development.
-
-=== Running tests
-
-Before checking in code, it must pass the following tests (along with their corresponding build targets):
-
-- compilation of the main targets and tests without warning: `make` and `make build_tests`
-- validation against the project's automatic formatting conventions: `make check-format` to run the check, `make format` to apply the transformation automatically
-- absence of clang-tidy warning: `make clang-tidy`
-- full test suite run: `make check` (test build included), `make test` (only run the tests)
-
-The `qa` target includes all of these checks, including auto-formatting:
+설치:
 
 ----
-make qa
+sudo cp ta/a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.ta /lib/optee_armtz/
 ----
 
-Note that, by default, the compilation and tests run in sequence and the output of failing tests is suppressed. To run in parallel, for example with eight threads, and print the output of failing tests, run this:
+처음 upstream OP-TEE `default_ta.pem` 기반 dev kit으로 빌드했을 때는 TA 파일은 생성됐지만 `TEEC_OpenSession()`에서 실패했습니다.
+Jetson R36.5 OP-TEE source package 기준 dev kit으로 다시 빌드한 뒤 TA open과 signing이 성공했습니다.
+
+== TEE smoke test 구현 방식
+
+aktualizr 전체 OTA 서버 연동 전에, TEE backend만 분리해서 검증하는 작은 smoke test를 만들었습니다.
+
+테스트 목적:
+
+* Normal World에서 `libteec`로 TA session을 열 수 있는지 확인
+* TA가 RSA-2048 key를 생성하거나 기존 key를 읽을 수 있는지 확인
+* Secure World에서 public key를 export할 수 있는지 확인
+* Secure World에서 RSA-PSS/SHA-256 signature를 생성할 수 있는지 확인
+
+테스트 프로그램의 핵심 흐름:
 
 ----
-CTEST_OUTPUT_ON_FAILURE=1 CTEST_PARALLEL_LEVEL=8 make -j8 qa
+TeeKeystore::IsAvailable()
+  -> TEEC_InitializeContext()
+  -> TEEC_OpenSession()
+
+TeeKeystore::ReadUptanePublicKey()
+  -> TA CMD_GET_PUBLIC_KEY
+  -> key가 없으면 TA CMD_PROVISION_KEY
+  -> RSA public key PEM 반환
+
+TeeKeystore::SignRsaPssSha256("{\"hello\":\"tee\"}")
+  -> Normal World에서 SHA-256 digest 생성
+  -> TA CMD_SIGN_RSA_PSS 호출
+  -> Secure World에서 RSA-PSS 서명
+  -> 256-byte signature 반환
 ----
 
-Some tests require additional setups, such as code coverage, HSM emulation or link:docs/ota-client-guide/modules/ROOT/pages/provisioning-methods-and-credentialszip.adoc[provisioning credentials]. The exact reference about these steps is the link:scripts/test.sh[main test script] used for CI. It is parametrized by a list of environment variables and is used by our CI environments. To use it, run it in the project's root directory:
+실행:
 
 ----
-./scripts/test.sh
+sudo env LD_LIBRARY_PATH=$HOME/Desktop/sor_aktualizr/build-teecheck/src/libaktualizr /tmp/tee_smoke
 ----
 
-Note that it will run CMake itself in a dedicated build directory.
-
-To get a list of the common environment variables and their corresponding system requirements, have a look at the link:ci/gitlab/.gitlab-ci.yml[Gitlab CI configuration] and the project's link:docker/[Dockerfiles].
-
-
-=== Tags
-
-Generate tags:
+성공 결과:
 
 ----
-make tags
+TEE smoke ok: public_key_pem=451 bytes, signature=256 bytes
 ----
 
-=== Building with Docker
+의미:
 
-Several Dockerfiles are provided to support building and testing the application without dependencies on your
-local environment.
+* `public_key_pem=451 bytes`: TA에서 RSA public key를 정상 export했습니다.
+* `signature=256 bytes`: RSA-2048 PSS signature가 Secure World에서 생성됐습니다.
+* 따라서 aktualizr의 TEE backend가 실제 TA를 통해 key access와 signing을 수행함을 확인했습니다.
 
-If you have a working docker client and docker server running on your machine, you can build and run a docker
-image on the default environment with:
+== 현재 상태
 
-----
-./scripts/run_docker_test.sh Dockerfile
-----
+완료:
 
-It will start a shell session inside the container, running as the same UID/GID as on the host system, with
-the current directory mounted as a docker volume. Any local code changes are then immediately in effect
-inside the container and user/group permissions are compatible in the two environments.
+* aktualizr TEE backend 빌드 성공
+* TA 빌드 성공
+* TA 설치 성공
+* `test_keymanager` 성공
+* `test_config` 성공
+* 실제 TEE smoke test 성공
 
-Inside the container, the test suite with coverage can be run with:
+남은 작업:
 
-----
-TEST_WITH_COVERAGE=1 TEST_WITH_P11=1 TEST_WITH_STATICTESTS=1 ./scripts/test.sh
-----
-
-(see the content of link:ci/gitlab/.gitlab-ci.yml[] and link:scripts/test.sh[] for more testing options)
-
-Alternatively, link:scripts/run_docker_test.sh[] can directly run the test script:
-
-----
-./scripts/run_docker_test.sh Dockerfile \
-                            -eTEST_WITH_COVERAGE=1 \
-                            -eTEST_WITH_P11=1 \
-                            -eTEST_WITH_STATICTESTS=1 \
-                            -- ./scripts/test.sh
-----
-
-== Usage
-
-=== Configuration
-
-To run the aktualizr client, you will need to provide a toml-formatted configuration file using the command line option `-c` or `--config`:
-
-----
-aktualizr -c <path/configfile>
-----
-
-Additional command line options can be found link:./src/aktualizr_primary/main.cc[in the code] or by running `aktualizr --help`. More details on configuring aktualizr can be found in link:docs/ota-client-guide/modules/ROOT/pages/aktualizr-config-options.adoc[]. If you are using https://github.com/advancedtelematic/meta-updater[meta-updater], more information about configuring aktualizr in that environment can be found there.
-
-[#fake-device]
-=== Running a "fake" device
-
-Aktualizr is generally intended to run on embedded devices, but you may find it convenient to run it on your local system for development or testing. To get a binary you can run locally, you can:
-
-* follow the <<building,build instructions>>,
-* install a Ubuntu packages from the https://github.com/advancedtelematic/aktualizr/releases[Releases page], or
-* install through <<mac-support,Homebrew on MacOS>>
-
-Some more detailed instructions on how to configure a fake device can be found on https://docs.ota.here.com/quickstarts/install-a-client-locally-with-fake-secondaries.html[the OTA Connect docs site].
-
-=== Provisioning
-
-If you intend to use aktualizr to authenticate with a server, you will need some form of provisioning. Aktualizr currently supports provisioning with shared credentials or with device credentials. Device credential provisioning supports using an HSM to store private keys. The differences and details are explained in link:docs/ota-client-guide/modules/ROOT/pages/client-provisioning-methods.adoc[] and link:docs/ota-client-guide/modules/ROOT/pages/enable-device-cred-provisioning.adoc[]. You can learn more about the credentials files used to support provisioning in link:docs/ota-client-guide/modules/ROOT/pages/provisioning-methods-and-credentialszip.adoc[].
-
-== Changelog
-
-The changelog is available in link:CHANGELOG.md[].
-
-== Maintainers
-
-This code is maintained by the OTA team at https://www.here.com/products/automotive/ota-technology[HERE Technologies]. If you have questions about the project, please reach us through Github issues for this repository or email us at otaconnect.support@here.com.
-
-== Contribute
-
-Complete contribution guidelines can be found in link:CONTRIBUTING.md[].
-
-== License
-
-This code is licensed under the link:LICENSE[Mozilla Public License 2.0], a copy of which can be found in this repository. All code is copyright HERE Europe B.V., 2016-2020.
-
-We require that contributors accept the terms of Linux Foundation's link:https://developercertificate.org/[Developer Certificate of Origin]. Specific instructions can be found in link:CONTRIBUTING.md[].
+* 실제 OTA 서버와 연결한 end-to-end manifest signing 테스트
+* Secondary ECU key 분리 정책 설계
+* rollback counter 등 policy/storage hardening
