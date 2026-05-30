@@ -43,6 +43,13 @@ TEST(config, TomlInt) {
   EXPECT_EQ(conf.uptane.polling_sec, 99U);
 }
 
+TEST(config, TomlTeeCryptoSource) {
+  Config conf;
+  conf.updateFromTomlString("[uptane]\nkey_source = \"tee\"\nkey_type = \"RSA2048\"\n");
+  EXPECT_EQ(conf.uptane.key_source, CryptoSource::kTee);
+  EXPECT_EQ(conf.uptane.key_type, KeyType::kRSA2048);
+}
+
 /*
  * Check that user can specify Primary serial via a config file.
  */

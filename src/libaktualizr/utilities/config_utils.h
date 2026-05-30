@@ -115,6 +115,8 @@ inline void CopyFromConfig(CryptoSource& dest, const std::string& option_name, c
     std::string crypto_source{StripQuotesFromStrings(value.get())};
     if (crypto_source == "pkcs11") {
       dest = CryptoSource::kPkcs11;
+    } else if (crypto_source == "tee") {
+      dest = CryptoSource::kTee;
     } else {
       dest = CryptoSource::kFile;
     }

@@ -12,6 +12,7 @@
 #include "libaktualizr/types.h"
 #include "p11engine.h"
 #include "storage/invstorage.h"
+#include "tee_keystore.h"
 
 // by using constexpr the compiler can optimize out method calls when the
 // feature is disabled. We won't then need to link with the actual p11 engine
@@ -20,6 +21,12 @@
 static constexpr bool built_with_p11 = true;
 #else
 static constexpr bool built_with_p11 = false;
+#endif
+
+#ifdef BUILD_TEE
+static constexpr bool built_with_tee = true;
+#else
+static constexpr bool built_with_tee = false;
 #endif
 
 KeyManager::KeyManager(std::shared_ptr<INvStorage> backend, KeyManagerConfig config,
@@ -277,9 +284,19 @@ Json::Value KeyManager::signTuf(const Json::Value &in_data) const {
   std::string b64sig;
   if (config_.uptane_key_source == CryptoSource::kFile) {
     backend_->loadPrimaryPrivate(&private_key);
+  } else if (config_.uptane_key_source == CryptoSource::kTee) {
+    if (!built_with_tee) {
+      throw std::runtime_error("Aktualizr was built without OP-TEE support");
+    }
+    if (config_.uptane_key_type != KeyType::kRSA2048) {
+      throw std::runtime_error("OP-TEE Uptane signing currently supports RSA2048 only");
+    }
+    b64sig = Utils::toBase64(TeeKeystore::SignRsaPssSha256(Utils::jsonToCanonicalStr(in_data)));
   }
-  b64sig = Utils::toBase64(
-      Crypto::Sign(config_.uptane_key_type, crypto_engine, private_key, Utils::jsonToCanonicalStr(in_data)));
+  if (config_.uptane_key_source != CryptoSource::kTee) {
+    b64sig = Utils::toBase64(
+        Crypto::Sign(config_.uptane_key_type, crypto_engine, private_key, Utils::jsonToCanonicalStr(in_data)));
+  }
 
   Json::Value signature;
   switch (config_.uptane_key_type) {
@@ -318,7 +335,7 @@ std::string KeyManager::generateUptaneKeyPair() {
     if (primary_public.empty() && primary_private.empty()) {
       throw std::runtime_error("Could not get Uptane keys");
     }
-  } else {
+  } else if (config_.uptane_key_source == CryptoSource::kPkcs11) {
     if (!built_with_p11) {
       throw std::runtime_error("Aktualizr was built without PKCS#11 support!");
     }
@@ -330,6 +347,16 @@ std::string KeyManager::generateUptaneKeyPair() {
     if (primary_public.empty() && !(*p11_)->readUptanePublicKey(config_.p11.uptane_key_id, &primary_public)) {
       throw std::runtime_error("Could not get Uptane keys");
     }
+  } else if (config_.uptane_key_source == CryptoSource::kTee) {
+    if (!built_with_tee) {
+      throw std::runtime_error("Aktualizr was built without OP-TEE support!");
+    }
+    if (config_.uptane_key_type != KeyType::kRSA2048) {
+      throw std::runtime_error("OP-TEE Uptane keys currently support RSA2048 only");
+    }
+    if (!TeeKeystore::ReadUptanePublicKey(&primary_public)) {
+      throw std::runtime_error("Could not get OP-TEE Uptane public key");
+    }
   }
   return primary_public;
 }
@@ -340,13 +367,23 @@ PublicKey KeyManager::UptanePublicKey() const {
     if (!backend_->loadPrimaryPublic(&primary_public)) {
       throw std::runtime_error("Could not get Uptane public key!");
     }
-  } else {
+  } else if (config_.uptane_key_source == CryptoSource::kPkcs11) {
     if (!built_with_p11) {
       throw std::runtime_error("Aktualizr was built without PKCS#11 support!");
     }
     // dummy read to check if the key is present
     if (!(*p11_)->readUptanePublicKey(config_.p11.uptane_key_id, &primary_public)) {
       throw std::runtime_error("Could not get Uptane public key!");
+    }
+  } else if (config_.uptane_key_source == CryptoSource::kTee) {
+    if (!built_with_tee) {
+      throw std::runtime_error("Aktualizr was built without OP-TEE support!");
+    }
+    if (config_.uptane_key_type != KeyType::kRSA2048) {
+      throw std::runtime_error("OP-TEE Uptane public key currently supports RSA2048 only");
+    }
+    if (!TeeKeystore::ReadUptanePublicKey(&primary_public)) {
+      throw std::runtime_error("Could not get OP-TEE Uptane public key!");
     }
   }
   return PublicKey(primary_public, config_.uptane_key_type);

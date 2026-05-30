@@ -106,7 +106,7 @@ inline std::istream &operator>>(std::istream &is, KeyType &kt) {
   return is;
 }
 
-enum class CryptoSource { kFile = 0, kPkcs11 };
+enum class CryptoSource { kFile = 0, kPkcs11, kTee };
 
 inline std::ostream &operator<<(std::ostream &os, CryptoSource cs) {
   std::string cs_str;
@@ -116,6 +116,9 @@ inline std::ostream &operator<<(std::ostream &os, CryptoSource cs) {
       break;
     case CryptoSource::kPkcs11:
       cs_str = "pkcs11";
+      break;
+    case CryptoSource::kTee:
+      cs_str = "tee";
       break;
     default:
       cs_str = "unknown";

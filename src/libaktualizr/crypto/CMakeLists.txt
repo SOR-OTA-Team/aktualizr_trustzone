@@ -3,7 +3,8 @@ set(SOURCES crypto.cc
 
 set(HEADERS crypto.h
             keymanager.h
-            openssl_compat.h)
+            openssl_compat.h
+            tee_keystore.h)
 
 set_source_files_properties(p11engine.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
 
@@ -12,6 +13,7 @@ set_source_files_properties(p11engine.cc PROPERTIES COMPILE_FLAGS -Wno-deprecate
 # in OpenSSL 1.1 and not deprecated. For more discussion, see:
 # https://github.com/uptane/aktualizr/issues/83
 set_source_files_properties(crypto.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
+set_source_files_properties(tee_keystore.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
 
 add_library(crypto OBJECT ${SOURCES})
 aktualizr_source_file_checks(${SOURCES} ${HEADERS})
@@ -25,6 +27,13 @@ else(BUILD_P11)
     target_sources(crypto PRIVATE p11engine_dummy.cc)
 endif(BUILD_P11)
 
+if(BUILD_TEE)
+    target_sources(crypto PRIVATE tee_keystore.cc)
+    target_include_directories(crypto PRIVATE ${TEEC_INCLUDE_DIR})
+else(BUILD_TEE)
+    target_sources(crypto PRIVATE tee_keystore_dummy.cc)
+endif(BUILD_TEE)
+
 add_aktualizr_test(NAME crypto SOURCES crypto_test.cc PROJECT_WORKING_DIRECTORY)
 add_aktualizr_test(NAME hash SOURCES hash_test.cc PROJECT_WORKING_DIRECTORY)
 add_aktualizr_test(NAME keymanager SOURCES keymanager_test.cc PROJECT_WORKING_DIRECTORY)
@@ -32,4 +41,6 @@ set_property(SOURCE crypto_test.cc keymanager_test.cc PROPERTY COMPILE_DEFINITIO
 
 set_tests_properties(test_crypto test_hash test_keymanager PROPERTIES LABELS "crypto")
 
-aktualizr_source_file_checks(p11engine.cc p11engine_dummy.cc p11engine.h ${TEST_SOURCES})
+aktualizr_source_file_checks(p11engine.cc p11engine_dummy.cc p11engine.h
+                             tee_keystore.cc tee_keystore_dummy.cc tee_keystore.h
+                             ${TEST_SOURCES})
