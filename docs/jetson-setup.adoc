@@ -1,0 +1,135 @@
+= Jetson Orin Nano OP-TEE 환경 구성
+:toc: left
+:toclevels: 2
+
+== 대상 하드웨어
+
+[cols="1,2"]
+|===
+| 항목 | 값
+
+| Hardware | NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
+| Jetson Linux | R36.5.0
+| Kernel | 5.15.185-tegra
+| OP-TEE | `nvidia-l4t-optee` 36.5.0-20260115194252
+|===
+
+== OP-TEE 런타임 설치
+
+Jetson Linux 36.5에는 OP-TEE가 기본 포함되어 있습니다.
+`nvidia-l4t-optee` 패키지를 설치하면 다음이 함께 들어옵니다.
+
+* OP-TEE OS (Secure World 커널, BL32)
+* `tee-supplicant` 데몬
+* `libteec` 사용자 라이브러리 + 헤더
+
+```bash
+sudo apt update
+sudo apt install nvidia-l4t-optee libteec-dev
+```
+
+설치 후 `/dev/tee0` 와 `/dev/teepriv0` 디바이스 노드가 보여야 합니다.
+
+```bash
+ls /dev/tee*
+# /dev/tee0  /dev/teepriv0
+```
+
+`tee-supplicant` 가 부팅 시 자동 실행되는지 확인합니다.
+
+```bash
+systemctl status tee-supplicant
+```
+
+== OP-TEE TA Dev Kit 빌드
+
+TA를 빌드하려면 `export-ta_arm64` Dev Kit이 필요합니다.
+
+[IMPORTANT]
+====
+**upstream OP-TEE 의 `default_ta.pem` 으로 빌드한 TA는 Jetson 에서 로드되지 않습니다.**
+
+증상: `TEEC_OpenSession()` 호출 시 `0xFFFF000C` (`TEE_ERROR_ITEM_NOT_FOUND`) 또는
+TA signature 검증 실패.
+
+원인: Jetson R36.5 OP-TEE는 NVIDIA가 별도 서명 키로 빌드한 OP-TEE OS를 사용하며,
+TA 도 동일한 키로 서명되어야 합니다.
+
+해결: Jetson L4T BSP 의 OP-TEE source package 에서 직접 Dev Kit 을 빌드해야 합니다.
+====
+
+=== Jetson L4T OP-TEE source 받기
+
+NVIDIA L4T BSP 에서 OP-TEE source 와 매칭되는 `default_ta.pem` 을 확보합니다.
+
+```bash
+# L4T BSP source 압축 해제 후
+cd Linux_for_Tegra/source/optee/optee_os
+```
+
+=== TA Dev Kit 빌드
+
+```bash
+cd optee_os
+make -j$(nproc) \
+  PLATFORM=tegra \
+  CFG_ARM64_core=y \
+  CFG_TEE_CORE_LOG_LEVEL=2 \
+  CFG_TA_OPTEE_CORE_API_COMPAT_1_1=y \
+  O=out
+
+# Dev Kit 출력 경로
+export TA_DEV_KIT_DIR=$(pwd)/out/export-ta_arm64
+```
+
+== TA 빌드
+
+```bash
+cd <aktualizr_trustzone>/ta
+TA_DEV_KIT_DIR=$TA_DEV_KIT_DIR \
+  make CROSS_COMPILE=aarch64-linux-gnu-
+```
+
+생성물:
+
+```
+ta/a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.ta    ← 서명된 TA 바이너리
+ta/a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.elf   ← 디버그용 ELF
+```
+
+== TA 설치
+
+```bash
+sudo cp ta/a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.ta /lib/optee_armtz/
+```
+
+`tee-supplicant` 가 디렉터리를 watch 하므로 재시작은 불필요합니다.
+
+== 동작 확인
+
+```bash
+# 권한 확인
+ls -l /dev/tee0
+# crw-rw---- 1 root tee ...
+
+# 본인 계정을 tee 그룹에 추가하거나 sudo 로 실행
+sudo /tmp/tee_smoke
+```
+
+기대 출력:
+
+```
+TEE smoke ok: public_key_pem=451 bytes, signature=256 bytes
+```
+
+== Troubleshooting
+
+[cols="1,3"]
+|===
+| 증상 | 원인 / 해결
+
+| `TEEC_InitializeContext` 실패 | `tee-supplicant` 미실행. `sudo systemctl start tee-supplicant`
+| `TEEC_OpenSession` → `0xFFFF000C` | TA 미설치 또는 서명 불일치. `/lib/optee_armtz/` 확인 + Jetson Dev Kit 으로 재빌드
+| `TEEC_InvokeCommand` → `0xFFFF3024` (`TARGET_DEAD`) | TA 내부 panic. OP-TEE 로그 확인 (`dmesg \| grep optee`)
+| Permission denied on `/dev/tee0` | `sudo` 로 실행하거나 사용자 계정을 `tee` 그룹에 추가
+|===

@@ -1,0 +1,229 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c15c5a9e..c67a5d8a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,7 @@ option(PEDANTIC_WARNINGS "Compile with pedantic warnings" OFF)
+ option(BUILD_WITH_CODE_COVERAGE "Enable gcov code coverage" OFF)
+ option(BUILD_OSTREE "Set to ON to compile with OSTree support" OFF)
+ option(BUILD_P11 "Support for key storage in a HSM via PKCS#11" OFF)
++option(BUILD_TEE "Support for Uptane key storage in OP-TEE" OFF)
+ option(BUILD_SOTA_TOOLS "Set to ON to build SOTA tools" OFF)
+ option(FAULT_INJECTION "Set to ON to enable fault injection" OFF)
+ option(TESTSUITE_VALGRIND "Set to ON to make tests to run under valgrind (default when CMAKE_BUILD_TYPE=Valgrind)" ${TESTSUITE_VALGRIND_DEFAULT})
+@@ -139,6 +140,19 @@ if(BUILD_P11)
+     endif()
+ endif(BUILD_P11)
+ 
++if(BUILD_TEE)
++    find_library(TEEC_LIB teec REQUIRED)
++    find_path(TEEC_INCLUDE_DIR tee_client_api.h
++        HINTS /usr/include /usr/local/include
++        PATH_SUFFIXES optee)
++    if(NOT TEEC_INCLUDE_DIR)
++        message(FATAL_ERROR "tee_client_api.h not found. Install libteec-dev or optee_client.")
++    endif()
++    add_definitions(-DBUILD_TEE)
++    include_directories(${TEEC_INCLUDE_DIR})
++    link_libraries(${TEEC_LIB})
++endif(BUILD_TEE)
++
+ if(BUILD_SOTA_TOOLS)
+     find_package(GLIB2 REQUIRED)
+     find_program(STRACE NAMES strace)
+diff --git a/include/libaktualizr/types.h b/include/libaktualizr/types.h
+index 3ceb1b71..dfb3d0ca 100644
+--- a/include/libaktualizr/types.h
++++ b/include/libaktualizr/types.h
+@@ -106,7 +106,7 @@ inline std::istream &operator>>(std::istream &is, KeyType &kt) {
+   return is;
+ }
+ 
+-enum class CryptoSource { kFile = 0, kPkcs11 };
++enum class CryptoSource { kFile = 0, kPkcs11, kTee };
+ 
+ inline std::ostream &operator<<(std::ostream &os, CryptoSource cs) {
+   std::string cs_str;
+@@ -117,6 +117,9 @@ inline std::ostream &operator<<(std::ostream &os, CryptoSource cs) {
+     case CryptoSource::kPkcs11:
+       cs_str = "pkcs11";
+       break;
++    case CryptoSource::kTee:
++      cs_str = "tee";
++      break;
+     default:
+       cs_str = "unknown";
+       break;
+diff --git a/src/libaktualizr/config/config_test.cc b/src/libaktualizr/config/config_test.cc
+index 73719e5c..ff8ee235 100644
+--- a/src/libaktualizr/config/config_test.cc
++++ b/src/libaktualizr/config/config_test.cc
+@@ -43,6 +43,13 @@ TEST(config, TomlInt) {
+   EXPECT_EQ(conf.uptane.polling_sec, 99U);
+ }
+ 
++TEST(config, TomlTeeCryptoSource) {
++  Config conf;
++  conf.updateFromTomlString("[uptane]\nkey_source = \"tee\"\nkey_type = \"RSA2048\"\n");
++  EXPECT_EQ(conf.uptane.key_source, CryptoSource::kTee);
++  EXPECT_EQ(conf.uptane.key_type, KeyType::kRSA2048);
++}
++
+ /*
+  * Check that user can specify Primary serial via a config file.
+  */
+diff --git a/src/libaktualizr/crypto/CMakeLists.txt b/src/libaktualizr/crypto/CMakeLists.txt
+index 55519889..6a5ad578 100644
+--- a/src/libaktualizr/crypto/CMakeLists.txt
++++ b/src/libaktualizr/crypto/CMakeLists.txt
+@@ -3,7 +3,8 @@ set(SOURCES crypto.cc
+ 
+ set(HEADERS crypto.h
+             keymanager.h
+-            openssl_compat.h)
++            openssl_compat.h
++            tee_keystore.h)
+ 
+ set_source_files_properties(p11engine.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
+ 
+@@ -12,6 +13,7 @@ set_source_files_properties(p11engine.cc PROPERTIES COMPILE_FLAGS -Wno-deprecate
+ # in OpenSSL 1.1 and not deprecated. For more discussion, see:
+ # https://github.com/uptane/aktualizr/issues/83
+ set_source_files_properties(crypto.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
++set_source_files_properties(tee_keystore.cc PROPERTIES COMPILE_FLAGS -Wno-deprecated-declarations)
+ 
+ add_library(crypto OBJECT ${SOURCES})
+ aktualizr_source_file_checks(${SOURCES} ${HEADERS})
+@@ -25,6 +27,13 @@ else(BUILD_P11)
+     target_sources(crypto PRIVATE p11engine_dummy.cc)
+ endif(BUILD_P11)
+ 
++if(BUILD_TEE)
++    target_sources(crypto PRIVATE tee_keystore.cc)
++    target_include_directories(crypto PRIVATE ${TEEC_INCLUDE_DIR})
++else(BUILD_TEE)
++    target_sources(crypto PRIVATE tee_keystore_dummy.cc)
++endif(BUILD_TEE)
++
+ add_aktualizr_test(NAME crypto SOURCES crypto_test.cc PROJECT_WORKING_DIRECTORY)
+ add_aktualizr_test(NAME hash SOURCES hash_test.cc PROJECT_WORKING_DIRECTORY)
+ add_aktualizr_test(NAME keymanager SOURCES keymanager_test.cc PROJECT_WORKING_DIRECTORY)
+@@ -32,4 +41,6 @@ set_property(SOURCE crypto_test.cc keymanager_test.cc PROPERTY COMPILE_DEFINITIO
+ 
+ set_tests_properties(test_crypto test_hash test_keymanager PROPERTIES LABELS "crypto")
+ 
+-aktualizr_source_file_checks(p11engine.cc p11engine_dummy.cc p11engine.h ${TEST_SOURCES})
++aktualizr_source_file_checks(p11engine.cc p11engine_dummy.cc p11engine.h
++                             tee_keystore.cc tee_keystore_dummy.cc tee_keystore.h
++                             ${TEST_SOURCES})
+diff --git a/src/libaktualizr/crypto/keymanager.cc b/src/libaktualizr/crypto/keymanager.cc
+index d11f0bf3..ad839c7a 100644
+--- a/src/libaktualizr/crypto/keymanager.cc
++++ b/src/libaktualizr/crypto/keymanager.cc
+@@ -12,6 +12,7 @@
+ #include "libaktualizr/types.h"
+ #include "p11engine.h"
+ #include "storage/invstorage.h"
++#include "tee_keystore.h"
+ 
+ // by using constexpr the compiler can optimize out method calls when the
+ // feature is disabled. We won't then need to link with the actual p11 engine
+@@ -22,6 +23,12 @@ static constexpr bool built_with_p11 = true;
+ static constexpr bool built_with_p11 = false;
+ #endif
+ 
++#ifdef BUILD_TEE
++static constexpr bool built_with_tee = true;
++#else
++static constexpr bool built_with_tee = false;
++#endif
++
+ KeyManager::KeyManager(std::shared_ptr<INvStorage> backend, KeyManagerConfig config,
+                        const std::shared_ptr<P11EngineGuard> &p11)
+     : backend_(std::move(backend)), config_(std::move(config)) {
+@@ -277,9 +284,19 @@ Json::Value KeyManager::signTuf(const Json::Value &in_data) const {
+   std::string b64sig;
+   if (config_.uptane_key_source == CryptoSource::kFile) {
+     backend_->loadPrimaryPrivate(&private_key);
++  } else if (config_.uptane_key_source == CryptoSource::kTee) {
++    if (!built_with_tee) {
++      throw std::runtime_error("Aktualizr was built without OP-TEE support");
++    }
++    if (config_.uptane_key_type != KeyType::kRSA2048) {
++      throw std::runtime_error("OP-TEE Uptane signing currently supports RSA2048 only");
++    }
++    b64sig = Utils::toBase64(TeeKeystore::SignRsaPssSha256(Utils::jsonToCanonicalStr(in_data)));
++  }
++  if (config_.uptane_key_source != CryptoSource::kTee) {
++    b64sig = Utils::toBase64(
++        Crypto::Sign(config_.uptane_key_type, crypto_engine, private_key, Utils::jsonToCanonicalStr(in_data)));
+   }
+-  b64sig = Utils::toBase64(
+-      Crypto::Sign(config_.uptane_key_type, crypto_engine, private_key, Utils::jsonToCanonicalStr(in_data)));
+ 
+   Json::Value signature;
+   switch (config_.uptane_key_type) {
+@@ -318,7 +335,7 @@ std::string KeyManager::generateUptaneKeyPair() {
+     if (primary_public.empty() && primary_private.empty()) {
+       throw std::runtime_error("Could not get Uptane keys");
+     }
+-  } else {
++  } else if (config_.uptane_key_source == CryptoSource::kPkcs11) {
+     if (!built_with_p11) {
+       throw std::runtime_error("Aktualizr was built without PKCS#11 support!");
+     }
+@@ -330,6 +347,16 @@ std::string KeyManager::generateUptaneKeyPair() {
+     if (primary_public.empty() && !(*p11_)->readUptanePublicKey(config_.p11.uptane_key_id, &primary_public)) {
+       throw std::runtime_error("Could not get Uptane keys");
+     }
++  } else if (config_.uptane_key_source == CryptoSource::kTee) {
++    if (!built_with_tee) {
++      throw std::runtime_error("Aktualizr was built without OP-TEE support!");
++    }
++    if (config_.uptane_key_type != KeyType::kRSA2048) {
++      throw std::runtime_error("OP-TEE Uptane keys currently support RSA2048 only");
++    }
++    if (!TeeKeystore::ReadUptanePublicKey(&primary_public)) {
++      throw std::runtime_error("Could not get OP-TEE Uptane public key");
++    }
+   }
+   return primary_public;
+ }
+@@ -340,7 +367,7 @@ PublicKey KeyManager::UptanePublicKey() const {
+     if (!backend_->loadPrimaryPublic(&primary_public)) {
+       throw std::runtime_error("Could not get Uptane public key!");
+     }
+-  } else {
++  } else if (config_.uptane_key_source == CryptoSource::kPkcs11) {
+     if (!built_with_p11) {
+       throw std::runtime_error("Aktualizr was built without PKCS#11 support!");
+     }
+@@ -348,6 +375,16 @@ PublicKey KeyManager::UptanePublicKey() const {
+     if (!(*p11_)->readUptanePublicKey(config_.p11.uptane_key_id, &primary_public)) {
+       throw std::runtime_error("Could not get Uptane public key!");
+     }
++  } else if (config_.uptane_key_source == CryptoSource::kTee) {
++    if (!built_with_tee) {
++      throw std::runtime_error("Aktualizr was built without OP-TEE support!");
++    }
++    if (config_.uptane_key_type != KeyType::kRSA2048) {
++      throw std::runtime_error("OP-TEE Uptane public key currently supports RSA2048 only");
++    }
++    if (!TeeKeystore::ReadUptanePublicKey(&primary_public)) {
++      throw std::runtime_error("Could not get OP-TEE Uptane public key!");
++    }
+   }
+   return PublicKey(primary_public, config_.uptane_key_type);
+ }
+diff --git a/src/libaktualizr/utilities/config_utils.h b/src/libaktualizr/utilities/config_utils.h
+index 746cb36d..7acb52ae 100644
+--- a/src/libaktualizr/utilities/config_utils.h
++++ b/src/libaktualizr/utilities/config_utils.h
+@@ -115,6 +115,8 @@ inline void CopyFromConfig(CryptoSource& dest, const std::string& option_name, c
+     std::string crypto_source{StripQuotesFromStrings(value.get())};
+     if (crypto_source == "pkcs11") {
+       dest = CryptoSource::kPkcs11;
++    } else if (crypto_source == "tee") {
++      dest = CryptoSource::kTee;
+     } else {
+       dest = CryptoSource::kFile;
+     }

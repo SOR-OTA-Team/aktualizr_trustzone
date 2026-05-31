@@ -1,8 +1,0 @@
-SAVEPOINT MIGRATION;
-
-ALTER TABLE installed_versions ADD COLUMN is_current INTEGER NOT NULL CHECK ( is_current IN ( 0 , 1 ) ) DEFAULT 0;
-
-DELETE FROM version;
-INSERT INTO version VALUES(3);
-
-RELEASE MIGRATION;

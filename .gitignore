@@ -1,53 +1,15 @@
-# build folder
 build/
-/build-*
-/cmake-build-debug
+build-*/
+out/
 
-# clion
-/.idea
-
-# Compiled Object files
-*.slo
-*.lo
 *.o
-*.obj
+*.elf
+*.dmp
+*.map
+*.ta
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-/.project
-
-# Vim swap files
-.*.swp
-# ctags
-/tags
-
-# Libreoffice swap files
-.~lock*#
-
-__pycache__/
-
-# QT Creator
-CMakeLists.txt.user
-/docs/ota-client-guide/modules/ROOT/pages/_junk
-*.code-workspace
-.vscode/launch.json
-
-# clangd
-/.cache
+.DS_Store
+*.swp
+.cache/
+.idea/
+.vscode/

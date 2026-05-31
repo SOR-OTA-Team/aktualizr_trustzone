@@ -1,8 +1,0 @@
-CryptoSource DEFINITIONS ::= BEGIN
-
-  AKCryptoSource ::= ENUMERATED {
-	kFile,
-	kPkcs11,
-	...
-  }
-END
