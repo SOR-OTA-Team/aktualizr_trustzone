@@ -1,212 +1,227 @@
-= aktualizr_trustzone
+= aktualizr TrustZone TA
+:toc: left
+:toc-title: 목차
+:toclevels: 2
 
-`sor_aktualizr`에 TrustZone/OP-TEE 기반 TEE 서명 경로를 추가한 실험용 repository입니다.
+`sor_aktualizr`에 ARM TrustZone / OP-TEE 기반 TEE 서명 경로를 추가한 실험용 repository입니다.
 
-이 repository는 OP-TEE source repository가 아닙니다. OP-TEE는 Jetson Orin Nano에서 Secure World를 구성하고 TA를 실행하기 위한 런타임으로만 사용했습니다.
+Uptane OTA 클라이언트의 device private key를 Normal World 파일시스템이나 SQLite에 저장하지 않고,
+Secure World TA 내부에서만 생성·보관·사용하도록 분리하는 것이 목표입니다.
 
-== 목표
+[NOTE]
+====
+이 repository는 OP-TEE source repository가 아닙니다.
+OP-TEE는 Jetson Orin Nano에서 Secure World를 구성하고 TA를 실행하기 위한 런타임으로만 사용했습니다.
+====
 
-Uptane device private key를 Normal World 파일시스템이나 SQLite에 저장하지 않고, Secure World의 TA 내부에서만 생성/보관/사용하도록 분리했습니다.
+== 검증 환경
 
-구조는 다음과 같습니다.
+[cols="1,2"]
+|===
+| 항목 | 값
 
-----
-Normal World
-  aktualizr
-  keymanager.cc
-  tee_keystore.cc
-  libteec
+| Hardware | NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
+| Jetson Linux | R36.5.0
+| Kernel | 5.15.185-tegra
+| OP-TEE | `nvidia-l4t-optee` 36.5.0-20260115194252
+|===
 
-Secure World
-  aktualizr TA
-  RSA-2048 private key
-  RSA-PSS/SHA-256 signing
-----
+== 아키텍처
 
-Normal World는 OTA 흐름, Uptane metadata 처리, 네트워크, SQLite storage, 다운로드, 설치를 그대로 담당합니다.
+```
+┌────────────────────────────────────────┐     ┌─────────────────────────────────┐
+│          Normal World (Linux)          │     │   Secure World (OP-TEE TA)      │
+│                                        │     │                                 │
+│  aktualizr                             │     │  aktualizr_ta                   │
+│  ├── Uptane 프로토콜 처리              │     │  ├── RSA-2048 private key        │
+│  ├── 메타데이터 다운로드 및 검증       │     │  │   (TEE Secure Storage)        │
+│  ├── 이미지 다운로드 및 설치           │     │  ├── CMD_PROVISION_KEY           │
+│  ├── SQLite storage                    │     │  │   → RSA-2048 키쌍 생성       │
+│  └── keymanager.cc                     │     │  ├── CMD_GET_PUBLIC_KEY          │
+│      └── TeeKeystore (kTee mode)       │     │  │   → 공개키 export (PEM)      │
+│          └── tee_keystore.cc           │     │  └── CMD_SIGN_RSA_PSS            │
+│              (libteec 기반 TA client)  │     │      → RSA-PSS/SHA-256 서명     │
+│                                        │     │                                 │
+└────────────────┬───────────────────────┘     └──────────────┬──────────────────┘
+                 │          libteec / SMC                      │
+                 └─────────────────────────────────────────────┘
+```
 
-Secure World는 최소 기능만 담당합니다.
+Normal World는 OTA 흐름, Uptane 메타데이터 처리, 네트워크, SQLite, 이미지 다운로드·설치를 그대로 담당합니다.
+Secure World는 키 관련 최소 기능만 담당합니다.
 
-* Uptane RSA-2048 private key 생성
-* public key export
-* RSA-PSS/SHA-256 서명
+[NOTE]
+====
+ED25519는 구현하지 않았습니다.
+aktualizr의 기존 RSA-PSS 경로를 활용하기 위해 TEE backend는 RSA-2048 전용으로 구성했습니다.
+====
 
-ED25519는 구현하지 않았습니다. aktualizr의 기존 RSA-PSS 경로를 최대한 활용하기 위해 TEE backend는 RSA-2048 전용으로 구성했습니다.
+== 프로젝트 구조
 
-== 수정한 부분
+=== Secure World (ta/)
 
-=== Normal World
+[cols="2,3"]
+|===
+| 파일 | 역할
 
-`CMakeLists.txt`::
-`BUILD_TEE` 옵션을 추가하고, TEE 빌드 시 `libteec`를 링크하도록 수정했습니다.
+| `ta/aktualizr_ta.h` | TA UUID, Command ID, Key ID 정의
+| `ta/aktualizr_ta.c` | OP-TEE TA entry point + command dispatch
+| `ta/aktualizr_ta_rsa.c` | RSA-2048 키 생성·export·서명 구현
+| `ta/user_ta_header_defines.h` | OP-TEE TA metadata (스택/힙 크기 등)
+| `ta/Makefile`, `ta/sub.mk` | TA 빌드 구성
+|===
 
-`include/libaktualizr/types.h`::
-`CryptoSource::kTee`를 추가했습니다.
+=== Normal World 수정 파일
 
-`src/libaktualizr/utilities/config_utils.h`::
-TOML 설정에서 `key_source = "tee"`를 읽을 수 있도록 수정했습니다.
+[cols="2,3"]
+|===
+| 파일 | 변경 내용
 
-`src/libaktualizr/crypto/keymanager.cc`::
-Uptane RSA key 생성, public key 조회, manifest 서명을 TEE backend로 보낼 수 있도록 연결했습니다.
-TEE mode에서는 private key를 SQLite `private_keys`에 저장하지 않습니다.
+| `CMakeLists.txt` | `BUILD_TEE` 옵션 추가, TEE 빌드 시 `libteec` 링크
+| `include/libaktualizr/types.h` | `CryptoSource::kTee` 추가
+| `src/libaktualizr/utilities/config_utils.h` | `key_source = "tee"` TOML 파싱 지원
+| `src/libaktualizr/crypto/keymanager.cc` | Uptane 키 생성·조회·서명을 TEE backend로 위임
+| `src/libaktualizr/crypto/tee_keystore.h` | TEE backend API 정의
+| `src/libaktualizr/crypto/tee_keystore.cc` | libteec 기반 TA client 구현
+| `src/libaktualizr/crypto/tee_keystore_dummy.cc` | `BUILD_TEE=OFF` 시 링크 유지용 dummy
+| `src/libaktualizr/config/config_test.cc` | `key_source = "tee"` 설정 파싱 테스트 추가
+| `config/sota-device-cred-tee.toml` | TEE key source 설정 예시
+|===
 
-`src/libaktualizr/crypto/tee_keystore.h`::
-Normal World에서 사용하는 TEE backend API를 정의했습니다.
+== TA UUID 및 Command API
 
-`src/libaktualizr/crypto/tee_keystore.cc`::
-`libteec` 기반 TA client를 구현했습니다.
-TA session open, public key read, RSA-PSS signing command 호출을 담당합니다.
+=== UUID
 
-`src/libaktualizr/crypto/tee_keystore_dummy.cc`::
-`BUILD_TEE=OFF` 빌드에서도 링크가 깨지지 않도록 dummy backend를 추가했습니다.
+```
+a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c
+```
 
-`src/libaktualizr/config/config_test.cc`::
-`key_source = "tee"` 설정 파싱 테스트를 추가했습니다.
+TA 바이너리 파일명(`a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.ta`)과
+설치 경로(`/lib/optee_armtz/`) 모두 이 UUID를 사용합니다.
 
-`config/sota-device-cred-tee.toml`::
-TEE key source를 사용하는 설정 예시를 추가했습니다.
+=== Command 목록
 
-=== Secure World
+[cols="1,2,2,2,3"]
+|===
+| ID | 이름 | params[0] (INPUT) | params[1] (OUTPUT) | 설명
 
-`ta/aktualizr_ta.c`::
-OP-TEE TA entry point와 command dispatch를 구현했습니다.
+| `0x01` | `CMD_PROVISION_KEY` | `value.a`=key_type, `value.b`=gen_mode | — | RSA-2048 키쌍 생성 및 Secure Storage 저장 (키가 이미 있으면 no-op)
+| `0x02` | `CMD_GET_PUBLIC_KEY` | `value.a`=key_type | 264-byte raw (4-byte modulus_len \| 256-byte modulus \| 4-byte exponent) | 공개키 원소 반환 (NW에서 PEM 조립)
+| `0x03` | `CMD_SIGN_RSA_PSS` | 32-byte SHA-256 digest | 256-byte RSA-PSS 서명 | RSA-PSS/SHA-256 서명 (NW에서 digest 계산 후 전달)
+|===
 
-`ta/aktualizr_ta_rsa.c`::
-RSA-2048 key 생성, public key export, RSA-PSS/SHA-256 signing을 구현했습니다.
+== 빌드
 
-`ta/aktualizr_ta.h`::
-TA UUID, command ID, key ID를 정의했습니다.
+=== Normal World (aktualizr with TEE backend)
 
-`ta/user_ta_header_defines.h`::
-OP-TEE TA metadata를 정의했습니다.
-
-`ta/Makefile`, `ta/sub.mk`::
-TA 빌드 구성을 추가했습니다.
-
-== 테스트 환경
-
-----
-Hardware: NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
-Jetson Linux: R36.5.0
-Kernel: 5.15.185-tegra
-OP-TEE package: nvidia-l4t-optee 36.5.0-20260115194252
-----
-
-== 빌드 테스트
-
-TEE 옵션을 켜고 aktualizr를 빌드했습니다.
-
-----
-cmake -S . -B build-teecheck \
+```bash
+cmake -S . -B build-tee \
   -DBUILD_OSTREE=OFF \
   -DBUILD_P11=OFF \
   -DBUILD_TEE=ON \
   -DBUILD_SOTA_TOOLS=OFF
 
-cmake --build build-teecheck --target aktualizr -j2
-----
+cmake --build build-tee --target aktualizr -j$(nproc)
+```
 
-결과: 성공
+=== Secure World (TA)
 
-== 단위 테스트
+TA는 Jetson L4T R36.5 OP-TEE source package에서 생성한 `export-ta_arm64` dev kit으로 빌드합니다.
 
-기존 keymanager/config 테스트가 깨지지 않는지 확인했습니다.
+[IMPORTANT]
+====
+upstream OP-TEE `default_ta.pem` 기반 dev kit으로 빌드하면 TA 파일은 생성되지만
+`TEEC_OpenSession()`에서 실패합니다.
+반드시 *Jetson R36.5 OP-TEE source package* 기준 dev kit을 사용해야 합니다.
+====
 
-----
-cmake --build build-default-teecheck --target t_keymanager -j2
-cd build-default-teecheck
-ctest -R test_keymanager --output-on-failure
-----
-
-결과: 성공
-
-----
-cmake --build build-default-teecheck --target t_config -j2
-cd build-default-teecheck
-ctest -R test_config --output-on-failure
-----
-
-결과: 성공
-
-== TA 빌드 및 설치
-
-TA는 Jetson L4T R36.5 OP-TEE source package에서 생성한 `export-ta_arm64` dev kit으로 빌드했습니다.
-
-----
+```bash
 TA_DEV_KIT_DIR=<Jetson OP-TEE export-ta_arm64> \
   make -C ta CROSS_COMPILE=aarch64-linux-gnu-
-----
+```
 
-설치:
+=== TA 설치
 
-----
+```bash
 sudo cp ta/a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c.ta /lib/optee_armtz/
-----
+```
 
-처음 upstream OP-TEE `default_ta.pem` 기반 dev kit으로 빌드했을 때는 TA 파일은 생성됐지만 `TEEC_OpenSession()`에서 실패했습니다.
-Jetson R36.5 OP-TEE source package 기준 dev kit으로 다시 빌드한 뒤 TA open과 signing이 성공했습니다.
+== 테스트
 
-== TEE smoke test 구현 방식
+=== 단위 테스트 (기존 aktualizr 테스트)
 
-aktualizr 전체 OTA 서버 연동 전에, TEE backend만 분리해서 검증하는 작은 smoke test를 만들었습니다.
+기존 keymanager/config 테스트가 TEE 수정 후에도 정상 동작함을 확인했습니다.
 
-테스트 목적:
+```bash
+cmake -S . -B build-default \
+  -DBUILD_OSTREE=OFF -DBUILD_P11=OFF -DBUILD_TEE=OFF -DBUILD_SOTA_TOOLS=OFF
 
-* Normal World에서 `libteec`로 TA session을 열 수 있는지 확인
-* TA가 RSA-2048 key를 생성하거나 기존 key를 읽을 수 있는지 확인
-* Secure World에서 public key를 export할 수 있는지 확인
-* Secure World에서 RSA-PSS/SHA-256 signature를 생성할 수 있는지 확인
+cmake --build build-default --target t_keymanager t_config -j$(nproc)
 
-테스트 프로그램의 핵심 흐름:
+cd build-default
+ctest -R "test_keymanager|test_config" --output-on-failure
+```
 
-----
-TeeKeystore::IsAvailable()
-  -> TEEC_InitializeContext()
-  -> TEEC_OpenSession()
+결과: *성공*
 
-TeeKeystore::ReadUptanePublicKey()
-  -> TA CMD_GET_PUBLIC_KEY
-  -> key가 없으면 TA CMD_PROVISION_KEY
-  -> RSA public key PEM 반환
+=== TEE Smoke test
 
-TeeKeystore::SignRsaPssSha256("{\"hello\":\"tee\"}")
-  -> Normal World에서 SHA-256 digest 생성
-  -> TA CMD_SIGN_RSA_PSS 호출
-  -> Secure World에서 RSA-PSS 서명
-  -> 256-byte signature 반환
-----
+Normal World에서 `libteec`를 통해 TA가 정상 동작하는지 검증하는 smoke test입니다.
+
+검증 항목:
+
+* `TEEC_InitializeContext()` / `TEEC_OpenSession()` 성공
+* `CMD_PROVISION_KEY` — RSA-2048 키쌍 생성 (또는 기존 키 로드)
+* `CMD_GET_PUBLIC_KEY` — 공개키 export 및 PEM 변환
+* `CMD_SIGN_RSA_PSS` — RSA-PSS/SHA-256 서명 생성
 
 실행:
 
-----
-sudo env LD_LIBRARY_PATH=$HOME/Desktop/sor_aktualizr/build-teecheck/src/libaktualizr /tmp/tee_smoke
-----
+```bash
+sudo env LD_LIBRARY_PATH=<build>/src/libaktualizr /tmp/tee_smoke
+```
 
-성공 결과:
+성공 출력:
 
-----
+```
 TEE smoke ok: public_key_pem=451 bytes, signature=256 bytes
-----
+```
 
-의미:
+* `public_key_pem=451 bytes`: TA에서 RSA-2048 공개키를 정상 export
+* `signature=256 bytes`: RSA-2048 PSS signature가 Secure World에서 생성
 
-* `public_key_pem=451 bytes`: TA에서 RSA public key를 정상 export했습니다.
-* `signature=256 bytes`: RSA-2048 PSS signature가 Secure World에서 생성됐습니다.
-* 따라서 aktualizr의 TEE backend가 실제 TA를 통해 key access와 signing을 수행함을 확인했습니다.
+== 설정
+
+TEE key source를 사용하는 `aktualizr` 설정 예시 (`config/sota-device-cred-tee.toml` 참고):
+
+```toml
+[uptane]
+key_source = "tee"
+```
+
+`key_source = "tee"` 설정 시 aktualizr는 Uptane RSA 키 생성·조회·서명을 모두 TEE backend로 위임합니다.
+TEE mode에서는 private key를 SQLite `primary_keys` 테이블에 저장하지 않습니다.
 
 == 현재 상태
 
-완료:
+=== 완료
 
-* aktualizr TEE backend 빌드 성공
-* TA 빌드 성공
-* TA 설치 성공
-* `test_keymanager` 성공
-* `test_config` 성공
-* 실제 TEE smoke test 성공
+* [x] aktualizr TEE backend 빌드 성공
+* [x] TA 빌드 성공 (Jetson R36.5 dev kit 기준)
+* [x] TA 설치 및 `TEEC_OpenSession()` 성공
+* [x] `test_keymanager` / `test_config` 기존 테스트 통과
+* [x] TEE smoke test 성공 — 공개키 export + RSA-PSS 서명 검증
 
-남은 작업:
+=== 남은 작업
 
-* 실제 OTA 서버와 연결한 end-to-end manifest signing 테스트
-* Secondary ECU key 분리 정책 설계
-* rollback counter 등 policy/storage hardening
+* [ ] 실제 OTA 서버와 연결한 end-to-end manifest signing 테스트
+* [ ] Secondary ECU key 분리 정책 설계
+* [ ] TLS private key TEE 보호 (현재는 Uptane signing 키만 TEE에 저장)
+* [ ] rollback counter 등 policy / storage hardening
+
+== 참고
+
+* https://optee.readthedocs.io/[OP-TEE Documentation]
+* https://globalplatform.org/specs-library/[GlobalPlatform TEE Internal API Specification]
+* https://github.com/uptane/aktualizr[aktualizr] — 원본 Uptane OTA 클라이언트
+* https://github.com/SOR-OTA-Team/Update_implementation[SOR-OTA-Team/Update_implementation] — 실제 배포 환경
