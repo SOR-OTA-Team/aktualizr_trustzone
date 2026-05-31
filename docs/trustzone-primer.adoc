@@ -1,0 +1,294 @@
+= ARM TrustZone 과 OP-TEE
+:toc: left
+:toc-title: 목차
+:toclevels: 3
+
+이 문서는 본 repository 가 활용하는 ARM TrustZone 과 OP-TEE 의 기초 개념을 설명합니다.
+TrustZone 을 처음 보는 사람도 이 repository 가 *왜 TA 안에 키를 두는가* 를 이해할 수 있도록
+하드웨어 보안 모델부터 TA 호출 흐름까지 정리합니다.
+
+== 1. TrustZone 이란
+
+ARM TrustZone 은 ARM Cortex-A 계열 SoC 에 내장된 *하드웨어 격리 메커니즘* 입니다.
+하나의 물리 CPU 코어를 두 개의 가상 실행 환경으로 분할합니다.
+
+[cols="1,1"]
+|===
+| Normal World (NW) | Secure World (SW)
+
+| 일반 OS (Linux, Android 등)
+| TEE OS (OP-TEE, Trusty, QSEE 등)
+
+| 사용자 앱, 디바이스 드라이버
+| Trusted Application (TA)
+
+| 디스크 / 네트워크 / 디스플레이 등 일반 자원
+| TEE Secure Storage, 보안 메모리
+
+| 침해 시 위험도 높음
+| TCB 최소화로 검증 가능
+|===
+
+[NOTE]
+====
+"하드웨어 격리"란 CPU 가 명령어를 실행할 때 현재 상태가 NW 인지 SW 인지를 *Non-Secure (NS) bit*
+한 비트로 구분하고, 메모리 컨트롤러·인터럽트 컨트롤러·버스 등 모든 주변 장치가 이 비트를 보고
+접근을 거절하거나 허용한다는 의미입니다. 소프트웨어가 우회할 수 없습니다.
+====
+
+=== 1.1 NS bit 와 메모리 격리
+
+```
+CPU State Register
+┌──────────────────────────────┐
+│  ... │ NS │ EL │ ... │ Mode │
+└──────────────────────────────┘
+         │
+         └── 0: Secure   (SW 에서 실행 중)
+             1: Non-Sec  (NW 에서 실행 중)
+
+Memory Controller (TZASC)
+   요청자 NS bit + 메모리 영역 속성 비교
+   → SW 전용 영역에 NW 가 접근 시 → bus error
+
+Interrupt Controller (GIC)
+   인터럽트마다 Secure / Non-Secure 분류
+   → SW 전용 인터럽트는 SW 에서만 수신
+```
+
+따라서 NW 에 있는 임의 코드(악성 커널, 루트킷 등)는 *원리적으로* SW 메모리를 읽을 수 없습니다.
+
+=== 1.2 World 전환 — Secure Monitor Call
+
+NW 에서 SW 의 서비스를 호출하려면 `SMC` 명령으로 *Secure Monitor* (EL3) 에 진입합니다.
+Secure Monitor 는 CPU 상태(NS bit, 레지스터, 스택 포인터 등) 를 저장·복원하고 SW 로 전환합니다.
+
+```
+NW (EL1: Linux kernel)
+    │
+    │  SMC #0     ◄── libteec 가 발행
+    ▼
+EL3: Secure Monitor
+    │  (context save / switch NS=0)
+    ▼
+SW (S-EL1: OP-TEE OS)
+    │
+    │  TA 디스패치
+    ▼
+SW (S-EL0: Trusted Application)
+```
+
+이 전환은 수십~수백 사이클로 빠르지만, *한 번의 SMC = 한 번의 컨텍스트 스위치* 이므로
+TA 호출은 가능한 한 묶어서 보내는 편이 효율적입니다.
+
+== 2. TEE 와 OP-TEE
+
+=== 2.1 TEE 정의
+
+*TEE (Trusted Execution Environment)* 는 GlobalPlatform 이 정의한 표준 보안 실행 환경입니다.
+TrustZone 위에서 동작하는 *OS 와 API 의 묶음* 으로 보면 됩니다.
+
+TEE 의 표준 API 두 개:
+
+[cols="1,2"]
+|===
+| API | 사용 측
+
+| TEE Internal API   | SW 의 TA 가 호출 (TEE OS 가 제공)
+| TEE Client API     | NW 의 일반 앱이 호출 (libteec 가 구현)
+|===
+
+이 두 API 가 표준이므로 같은 TA 코드가 OP-TEE, Trusty, Qualcomm QSEE 등에서
+대부분 그대로 동작합니다.
+
+=== 2.2 OP-TEE 구성
+
+*OP-TEE* 는 Linaro 가 관리하는 오픈소스 TEE 구현입니다.
+
+```
+┌──────────────────────────────────────┐  Normal World
+│  Linux 앱 (aktualizr 등)              │
+│      │                                │
+│      ▼                                │
+│  libteec  (libteec.so)               │
+│      │   TEEC_InvokeCommand()        │
+│      ▼                                │
+│  /dev/tee0, /dev/teepriv0            │
+│  optee 커널 드라이버                  │
+│      │  ioctl                         │
+└──────┼───────────────────────────────┘
+       │
+       ▼  SMC
+┌──────────────────────────────────────┐  Secure World
+│  OP-TEE OS (BL32)                    │
+│  ├── pseudo TA (built-in)            │
+│  └── 사용자 TA 로더                  │
+│         │                             │
+│         ▼                             │
+│  TA: aktualizr_ta.ta                 │
+│      (S-EL0 에서 실행)                │
+└──────────────────────────────────────┘
+       │
+       │  Secure Storage RPC
+       ▼
+┌──────────────────────────────────────┐  Normal World
+│  tee-supplicant (데몬)                │
+│  - REE 파일시스템에 암호화된 객체 저장 │
+└──────────────────────────────────────┘
+```
+
+각 컴포넌트 역할:
+
+[cols="1,3"]
+|===
+| 컴포넌트 | 역할
+
+| OP-TEE OS  | SW 측 마이크로커널. TA 로딩·스케줄링·메모리 보호.
+| Trusted Application | UUID 로 식별되는 단일 .ta 파일. RSA·ECDSA·AES 등 보안 연산 수행.
+| libteec    | NW 측 사용자 라이브러리. `TEEC_InvokeCommand()` 등 표준 API 제공.
+| optee 드라이버 | 리눅스 커널 모듈. `/dev/tee0` 노출 + SMC 발행.
+| tee-supplicant | 데몬. SW 가 NW 자원(파일시스템 등) 이 필요할 때 RPC 처리.
+|===
+
+=== 2.3 Secure Storage
+
+TA 가 `TEE_CreatePersistentObject()` 로 저장하는 객체는 *암호화된 후* NW 파일시스템
+(`/data/tee/` 등) 에 저장됩니다. 키는 SoC 의 하드웨어 키(`Hardware Unique Key`) 에서
+파생되므로 같은 보드 외에서는 복호화 불가능합니다.
+
+이 repository 의 RSA-2048 private key 가 저장되는 위치도 여기입니다.
+파일 자체는 NW 에 있지만 *내용은 SW 외부에서 복호화 불가능* 합니다.
+
+== 3. Trusted Application 모델
+
+=== 3.1 TA 구조
+
+모든 OP-TEE TA 는 네 개의 entry point 함수를 구현합니다.
+
+```c
+TEE_Result TA_CreateEntryPoint(void);
+void       TA_DestroyEntryPoint(void);
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t pt, TEE_Param p[4], void **ctx);
+void       TA_CloseSessionEntryPoint(void *ctx);
+
+TEE_Result TA_InvokeCommandEntryPoint(void *ctx, uint32_t cmd_id,
+                                       uint32_t pt, TEE_Param p[4]);
+```
+
+* `CreateEntryPoint` / `DestroyEntryPoint` — TA 로딩·언로딩 시 1회씩 호출
+* `OpenSessionEntryPoint` / `CloseSessionEntryPoint` — 클라이언트별 세션 시작/종료
+* `InvokeCommandEntryPoint` — 명령 디스패치. 본 repository 의 `CMD_PROVISION_KEY` 등은 모두 여기서 라우팅
+
+=== 3.2 파라미터 전달
+
+NW → TA 는 항상 4개의 슬롯 (`TEE_Param[4]`) 으로 데이터를 주고받습니다.
+각 슬롯은 다음 중 하나의 타입을 가집니다.
+
+[cols="1,3"]
+|===
+| 타입 | 의미
+
+| `VALUE_INPUT / VALUE_OUTPUT / VALUE_INOUT`  | 32 bit 값 두 개 (`value.a`, `value.b`)
+| `MEMREF_INPUT / MEMREF_OUTPUT / MEMREF_INOUT` | 버퍼 (`memref.buffer`, `memref.size`)
+| `NONE` | 사용 안 함
+|===
+
+본 repository 의 `CMD_SIGN_RSA_PSS` 예시:
+
+[cols="1,3"]
+|===
+| 슬롯 | 사용
+
+| `params[0]` | `MEMREF_INPUT` — NW 가 계산한 32 byte SHA-256 digest
+| `params[1]` | `MEMREF_OUTPUT` — TA 가 채워줄 256 byte RSA-PSS 서명
+| `params[2]`, `params[3]` | `NONE`
+|===
+
+=== 3.3 TA UUID
+
+TA 는 16 byte UUID 로 식별됩니다. `tee-supplicant` 가 NW 의 `/lib/optee_armtz/<UUID>.ta`
+경로에서 TA 바이너리를 찾아 SW 에 전달합니다.
+
+본 repository:
+
+```
+a6f79d6e-1b2c-4f8a-9bc3-d1e5f2a87b4c
+```
+
+NW 코드(`tee_keystore.cc`) 와 TA 코드(`aktualizr_ta.h`) 양쪽에 같은 UUID 가 박혀 있어야 합니다.
+
+== 4. OTA 시나리오에서 TrustZone 의 가치
+
+=== 4.1 위협 모델
+
+Uptane 기반 OTA 클라이언트에서 보호해야 하는 핵심 자산:
+
+[cols="1,2,2"]
+|===
+| 자산 | 침해 시 영향 | 기존 저장 위치
+
+| Uptane device private key | 가짜 ECU Manifest 서명 → 서버가 미설치 펌웨어를 설치로 오인 | SQLite (`primary_keys` 테이블)
+| TLS client private key    | 가짜 디바이스로 위장해 OTA 서버 접근 | SQLite (`tls_creds` 테이블)
+|===
+
+NW Linux 가 root 권한으로 완전히 침해되면 두 키 모두 *디스크에서 그대로 추출* 됩니다.
+
+=== 4.2 TrustZone 이 제공하는 보장
+
+키를 TA 안에 두면 다음 속성을 얻습니다.
+
+[cols="1,3"]
+|===
+| 속성 | 메커니즘
+
+| 키 비노출 | `TEE_GenerateKey()` 가 SW 메모리에서만 키 생성, NW 가 핸들만 받음
+| 디스크 추출 방어 | Secure Storage 가 HUK 로 암호화, 다른 보드에서 복호화 불가
+| 서명 오용 방어 | TA 내부에서 입력값 *구조 검증* 후에만 서명 수행 (Semantic Signing)
+| 재현 공격 방어 가능 | TA 가 단조 카운터 / 정책 객체를 함께 관리
+|===
+
+NW 가 침해돼도 공격자가 할 수 있는 일은 *기껏해야 "지금 이 보드에서 서명 한 번 받기"* 입니다.
+키 사본을 가져가서 다른 곳에서 사용하는 시나리오는 차단됩니다.
+
+=== 4.3 본 repository 의 적용 방식
+
+* `CMD_PROVISION_KEY` — RSA-2048 키쌍 *생성을 TA 안에서 수행*. 키가 NW 에 노출된 적이 없음
+* `CMD_GET_PUBLIC_KEY` — modulus + exponent 만 NW 로 반환. private exponent 는 SW 에 남음
+* `CMD_SIGN_RSA_PSS` — NW 는 digest 만 전달. 실제 서명 연산은 SW 의 `TEE_AsymmetricSignDigest()`
+
+자세한 호출 흐름은 link:../README.adoc#ta-명령-api[README — TA 명령 API] 참조.
+
+== 5. Jetson Orin Nano 에서의 OP-TEE
+
+NVIDIA Jetson Orin Nano (Cortex-A78AE) 는 ARMv8.2-A 기반이며 TrustZone Secure EL 을
+지원합니다. Jetson Linux R36 부터 OP-TEE 가 기본 구성 요소로 포함됩니다.
+
+[cols="1,2"]
+|===
+| 항목 | 값
+
+| Boot flow      | NVIDIA boot ROM → MB1/MB2 → ATF (BL31) → OP-TEE (BL32) → U-Boot (BL33) → Linux
+| OP-TEE 위치    | `/usr/lib/firmware/nvidia/optee.bin` (NVIDIA 서명)
+| 사용자 TA 경로 | `/lib/optee_armtz/<UUID>.ta`
+| 커널 디바이스 노드 | `/dev/tee0` (REE 앱용), `/dev/teepriv0` (supplicant 용)
+| `tee-supplicant` | `nvidia-l4t-optee` 패키지가 systemd unit 으로 등록
+|===
+
+[IMPORTANT]
+====
+Jetson 의 OP-TEE 는 NVIDIA 가 *별도 서명 키* (`default_ta.pem`) 로 빌드합니다.
+upstream OP-TEE 의 기본 키로 빌드한 TA 는 Jetson 에 설치해도 *서명 검증 실패* 로
+`TEEC_OpenSession()` 에서 거절됩니다.
+
+해결: Jetson L4T BSP 의 OP-TEE source 에서 직접 Dev Kit 을 빌드해 사용.
+link:jetson-setup.adoc[`jetson-setup.adoc`] 참조.
+====
+
+== 6. 학습 자료
+
+* https://optee.readthedocs.io/[OP-TEE 공식 문서]
+* https://developer.arm.com/documentation/100935/0100[ARM TrustZone for Cortex-A 백서]
+* https://globalplatform.org/specs-library/tee-internal-core-api-specification/[GlobalPlatform TEE Internal Core API Spec]
+* https://globalplatform.org/specs-library/tee-client-api-specification/[GlobalPlatform TEE Client API Spec]
+* https://github.com/OP-TEE/optee_examples[OP-TEE 예제 TA 모음]
